@@ -3,10 +3,14 @@ package com.wuyouai.ime.keyboard
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.RectF
-import android.graphics.Typeface
+import android.graphics.Shader
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
@@ -38,12 +42,28 @@ class KeyboardView @JvmOverloads constructor(
     private var theme = com.wuyouai.ime.themes.ThemeManager.byId("pure_white")
     private val settings = SettingsManager.get(context)
 
-    private val keyBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val specialBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val keyCapPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val capEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val keyTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val hintTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val iconPath = Path()
+    private val capRect = RectF()
+    private val shadowRect = RectF()
+    private val glyphBounds = Rect()
+
+    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val glowMatrix = Matrix()
+    private val glowBounds = RectF()
+    private var glowX = 0f
+    private var glowY = 0f
+    private var trackingGlow = false
+    private var glowReleasedAt = 0L
 
     // ---- 液态玻璃专用画笔 ----
     /** 背景墙：垂直渐变，让半透明键帽「透」出颜色变化 */
@@ -89,12 +109,20 @@ class KeyboardView @JvmOverloads constructor(
 
     fun setTheme(t: KeyboardTheme) {
         theme = t
-        keyBgPaint.color = t.keyBg
-        specialBgPaint.color = t.specialKeyBg
         keyTextPaint.color = t.keyText
-        hintTextPaint.color = t.keyText
-        pressedPaint.color = t.accent
-        shadowPaint.color = t.accent and 0x30FFFFFF
+        capEdgePaint.strokeWidth = dp(0.7f)
+        capEdgePaint.color = if (t.isDark) 0x20FFFFFF else 0x1C000000
+        iconPaint.strokeWidth = dp(1.65f)
+        glowPaint.strokeWidth = dp(1.5f)
+        glowPaint.shader = if (t.isDark && !t.liquidGlass) {
+            RadialGradient(
+                0f, 0f, dp(54f), t.accent, withAlpha(t.accent, 0), Shader.TileMode.CLAMP
+            )
+        } else {
+            trackingGlow = false
+            glowReleasedAt = 0L
+            null
+        }
 
         // 液态玻璃画笔
         wallTop = if (t.glassWallTop != 0) t.glassWallTop else t.bg
@@ -114,17 +142,11 @@ class KeyboardView @JvmOverloads constructor(
 
     private fun dp(v: Float): Float = v * density
 
-    /** 由按键底色推导阴影色：深色主题提亮一点，浅色主题压暗一点 */
-    private fun shadowColorOf(base: Int): Int {
-        val r = (base shr 16) and 0xFF
-        val g = (base shr 8) and 0xFF
-        val b = base and 0xFF
-        val k = if (theme.isDark) 1.18f else 0.86f
-        val nr = (r * k).toInt().coerceIn(0, 255)
-        val ng = (g * k).toInt().coerceIn(0, 255)
-        val nb = (b * k).toInt().coerceIn(0, 255)
-        return (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
-    }
+    private fun shadeColor(base: Int, factor: Float): Int = Color.rgb(
+        (Color.red(base) * factor).toInt().coerceAtMost(255),
+        (Color.green(base) * factor).toInt().coerceAtMost(255),
+        (Color.blue(base) * factor).toInt().coerceAtMost(255)
+    )
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
@@ -138,6 +160,7 @@ class KeyboardView @JvmOverloads constructor(
         } else {
             canvas.drawColor(theme.bg)
             drawFlatKeys(canvas, radius, shadowDy)
+            drawTouchGlow(canvas, radius)
         }
     }
 
@@ -145,26 +168,127 @@ class KeyboardView @JvmOverloads constructor(
     private fun drawFlatKeys(canvas: Canvas, radius: Float, shadowDy: Float) {
         keys.forEach { key ->
             val isSpecial = key.special != null
-            val baseColor = if (isSpecial) theme.specialKeyBg else theme.keyBg
+            val isEnter = key.special == SpecialKey.ENTER
+            val baseColor = when {
+                isEnter -> theme.accent
+                isSpecial && key.special != SpecialKey.SPACE -> theme.specialKeyBg
+                else -> theme.keyBg
+            }
 
-            // 1) 键帽阴影：在主键下方偏移绘制一层略深的同色，制造轻微立体感
             if (!key.pressed) {
-                shadowPaint.color = shadowColorOf(baseColor)
-                val sr = RectF(key.rect)
-                sr.offset(0f, shadowDy)
-                canvas.drawRoundRect(sr, radius, radius, shadowPaint)
+                shadowPaint.color = shadeColor(baseColor, if (theme.isDark) 0.55f else 0.86f)
+                shadowRect.set(key.rect)
+                shadowRect.offset(0f, shadowDy)
+                canvas.drawRoundRect(shadowRect, radius, radius, shadowPaint)
             }
 
-            // 2) 键帽本体
-            val bodyPaint = when {
-                key.pressed -> pressedPaint
-                isSpecial -> specialBgPaint
-                else -> keyBgPaint
+            setCapRect(key)
+            val bodyColor = when {
+                !key.pressed -> baseColor
+                theme.isDark && !isEnter -> shadeColor(baseColor, 1.38f)
+                else -> shadeColor(baseColor, 0.88f)
             }
-            canvas.drawRoundRect(key.rect, radius, radius, bodyPaint)
+            keyCapPaint.color = bodyColor
+            canvas.drawRoundRect(capRect, radius, radius, keyCapPaint)
+            canvas.drawRoundRect(capRect, radius, radius, capEdgePaint)
 
-            drawKeyLabel(canvas, key, isSpecial)
+            val iconColor = if (!isEnter) theme.keyText
+                else if (Color.luminance(bodyColor) > 0.179f) Color.BLACK else Color.WHITE
+            if (!isSpecial || !drawFunctionIcon(canvas, key.special, iconColor)) {
+                drawKeyLabel(canvas, key, isSpecial, capRect)
+            }
         }
+    }
+
+    /** 只移动绘制用的矩形，命中区域始终是原来的 key.rect。 */
+    private fun setCapRect(key: Key) {
+        capRect.set(key.rect)
+        if (key.pressed) capRect.offset(0f, dp(1.2f))
+    }
+
+    private fun drawFunctionIcon(canvas: Canvas, special: SpecialKey?, color: Int): Boolean {
+        val x = capRect.centerX()
+        val y = capRect.centerY()
+        val s = minOf(dp(10f), capRect.width() * 0.34f, capRect.height() * 0.29f)
+        iconPaint.color = color
+        iconPath.reset()
+        when (special) {
+            SpecialKey.SHIFT -> {
+                iconPath.moveTo(x, y - s * 0.9f)
+                iconPath.lineTo(x - s * 0.85f, y)
+                iconPath.lineTo(x - s * 0.38f, y)
+                iconPath.lineTo(x - s * 0.38f, y + s * 0.68f)
+                iconPath.lineTo(x + s * 0.38f, y + s * 0.68f)
+                iconPath.lineTo(x + s * 0.38f, y)
+                iconPath.lineTo(x + s * 0.85f, y)
+                iconPath.close()
+                if (isShift || isCapsLock) iconPaint.style = Paint.Style.FILL_AND_STROKE
+            }
+            SpecialKey.DELETE -> {
+                iconPath.moveTo(x - s, y)
+                iconPath.lineTo(x - s * 0.42f, y - s * 0.62f)
+                iconPath.lineTo(x + s * 0.9f, y - s * 0.62f)
+                iconPath.lineTo(x + s * 0.9f, y + s * 0.62f)
+                iconPath.lineTo(x - s * 0.42f, y + s * 0.62f)
+                iconPath.close()
+                iconPath.moveTo(x, y - s * 0.25f)
+                iconPath.lineTo(x + s * 0.5f, y + s * 0.25f)
+                iconPath.moveTo(x + s * 0.5f, y - s * 0.25f)
+                iconPath.lineTo(x, y + s * 0.25f)
+            }
+            SpecialKey.ENTER -> {
+                iconPath.moveTo(x + s * 0.8f, y - s * 0.58f)
+                iconPath.lineTo(x + s * 0.8f, y + s * 0.12f)
+                iconPath.lineTo(x - s * 0.72f, y + s * 0.12f)
+                iconPath.moveTo(x - s * 0.26f, y - s * 0.32f)
+                iconPath.lineTo(x - s * 0.72f, y + s * 0.12f)
+                iconPath.lineTo(x - s * 0.26f, y + s * 0.56f)
+            }
+            SpecialKey.SPACE -> {
+                iconPath.moveTo(x - s, y - s * 0.18f)
+                iconPath.lineTo(x - s, y + s * 0.22f)
+                iconPath.lineTo(x + s, y + s * 0.22f)
+                iconPath.lineTo(x + s, y - s * 0.18f)
+            }
+            else -> return false
+        }
+        canvas.drawPath(iconPath, iconPaint)
+        iconPaint.style = Paint.Style.STROKE
+        return true
+    }
+
+    /** 光晕只描亮指尖附近的键帽轮廓，不覆盖字或图标。 */
+    private fun drawTouchGlow(canvas: Canvas, radius: Float) {
+        val shader = glowPaint.shader ?: return
+        if (!trackingGlow && glowReleasedAt == 0L) return
+        val elapsed = if (trackingGlow) 0L else SystemClock.uptimeMillis() - glowReleasedAt
+        if (elapsed >= 210L) return
+
+        glowPaint.alpha = (255 * (210L - elapsed) / 210L).toInt()
+        glowMatrix.setTranslate(glowX, glowY)
+        shader.setLocalMatrix(glowMatrix)
+        val reach = dp(54f)
+        glowBounds.set(glowX - reach, glowY - reach, glowX + reach, glowY + reach)
+        keys.forEach { key ->
+            setCapRect(key)
+            if (RectF.intersects(capRect, glowBounds)) {
+                canvas.drawRoundRect(capRect, radius, radius, glowPaint)
+            }
+        }
+        if (!trackingGlow) postInvalidateOnAnimation()
+    }
+
+    private fun moveTouchGlow(x: Float, y: Float) {
+        if (!trackingGlow) return
+        glowX = x
+        glowY = y
+        invalidate()
+    }
+
+    private fun fadeTouchGlow() {
+        if (!trackingGlow) return
+        trackingGlow = false
+        glowReleasedAt = SystemClock.uptimeMillis()
     }
 
     /**
@@ -277,8 +401,8 @@ class KeyboardView @JvmOverloads constructor(
         (alpha shl 24) or (color and 0x00FFFFFF)
 
     /** 绘制单个按键的文字与提示 */
-    private fun drawKeyLabel(canvas: Canvas, key: Key, isSpecial: Boolean) {
-        val keyH = key.rect.height()
+    private fun drawKeyLabel(canvas: Canvas, key: Key, isSpecial: Boolean, rect: RectF = key.rect) {
+        val keyH = rect.height()
         val labelText = when {
             (mode == Mode.QWERTY_EN) && (isShift || isCapsLock) &&
                 key.output.length == 1 && key.output[0] in 'a'..'z' -> key.output.uppercase()
@@ -286,7 +410,7 @@ class KeyboardView @JvmOverloads constructor(
         }
         // 单字符字母键用较大的字号；功能键文本较长则缩小，防止撑出键帽
         val labelSize = if (isSpecial) {
-            minOf(keyH * 0.30f, key.rect.width() * 0.30f).coerceAtLeast(dp(11f))
+            minOf(keyH * 0.30f, rect.width() * 0.30f).coerceAtLeast(dp(11f))
         } else {
             keyH * 0.42f
         }
@@ -295,9 +419,22 @@ class KeyboardView @JvmOverloads constructor(
             color = theme.keyText
         } else keyTextPaint
         textPaintFor.textSize = labelSize
-        val fm = textPaintFor.fontMetrics
-        val baseline = key.rect.centerY() - (fm.ascent + fm.descent) / 2f
-        canvas.drawText(labelText, key.rect.centerX(), baseline, textPaintFor)
+        if (labelText == "，" || labelText == "。") {
+            // 全角标点的字形偏在字符格左下角，按笔画边界居中而非按字符宽度居中。
+            textPaintFor.textAlign = Paint.Align.LEFT
+            textPaintFor.getTextBounds(labelText, 0, labelText.length, glyphBounds)
+            canvas.drawText(
+                labelText,
+                rect.centerX() - glyphBounds.exactCenterX(),
+                rect.centerY() - glyphBounds.exactCenterY(),
+                textPaintFor
+            )
+            textPaintFor.textAlign = Paint.Align.CENTER
+        } else {
+            val fm = textPaintFor.fontMetrics
+            val baseline = rect.centerY() - (fm.ascent + fm.descent) / 2f
+            canvas.drawText(labelText, rect.centerX(), baseline, textPaintFor)
+        }
 
         // 九宫格字母提示（右上角，小字）
         if (key.hint.isNotEmpty()) {
@@ -308,8 +445,8 @@ class KeyboardView @JvmOverloads constructor(
             }
             canvas.drawText(
                 key.hint,
-                key.rect.right - dp(6f),
-                key.rect.top + dp(13f),
+                rect.right - dp(6f),
+                rect.top + dp(13f),
                 hintTextPaint
             )
         }
@@ -463,12 +600,15 @@ class KeyboardView @JvmOverloads constructor(
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 val key = keyAt(event.x, event.y) ?: return false
+                trackingGlow = glowPaint.shader != null
+                moveTouchGlow(event.x, event.y)
                 currentPressed = key
                 key.pressed = true
                 invalidate()
                 startLongPress(key)
             }
             MotionEvent.ACTION_MOVE -> {
+                moveTouchGlow(event.x, event.y)
                 val key = keyAt(event.x, event.y)
                 if (key !== currentPressed) {
                     currentPressed?.pressed = false
@@ -480,6 +620,7 @@ class KeyboardView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP -> {
+                fadeTouchGlow()
                 val key = currentPressed
                 stopLongPress()
                 cancelRepeatDelete()
@@ -491,6 +632,7 @@ class KeyboardView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
+                fadeTouchGlow()
                 currentPressed?.pressed = false
                 currentPressed = null
                 stopLongPress()
